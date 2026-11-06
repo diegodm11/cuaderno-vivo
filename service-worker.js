@@ -5,12 +5,21 @@ const APP_SHELL=[
   './styles.css',
   './product-core.css',
   './app.js',
+  './curriculum-engine.js',
   './reinforcement.js',
+  './classroom.js',
   './profile-i18n.js',
+  './learning-history.js',
+  './class-review.js',
+  './learning-capsules.js',
   './product-core.js',
+  './accessibility-demo.js',
+  './real-workflow.js',
   './pwa.js',
   './manifest.webmanifest',
   './vendor/qrcode.min.js',
+  './assets/logo-cuaderno-vivo-oficial.png',
+  './assets/logo-cuaderno-vivo-icono.png',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/maskable-512.png',
@@ -19,6 +28,7 @@ const APP_SHELL=[
   './media/tutorial/subtitulos-es.vtt',
   './media/tutorial/tutorial-cuaderno-vivo.mp4'
 ];
+const APP_SHELL_URLS=new Set(APP_SHELL.map(path=>new URL(path,self.registration.scope).href));
 self.addEventListener('install',event=>{
   event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(APP_SHELL)).then(()=>self.skipWaiting()));
 });
@@ -40,11 +50,29 @@ async function rangeResponse(request,cached){
   headers.set('Content-Length',String(end-start+1));
   return new Response(buffer.slice(start,end+1),{status:206,statusText:'Partial Content',headers});
 }
+async function networkFirst(request){
+  try{
+    const response=await fetch(request);
+    if(response.ok){
+      const copy=response.clone();
+      caches.open(CACHE).then(cache=>cache.put(request,copy));
+    }
+    return response;
+  }catch(error){
+    const cached=await caches.match(request,{ignoreSearch:true});
+    if(cached)return cached;
+    throw error;
+  }
+}
 self.addEventListener('fetch',event=>{
   const request=event.request;
   if(request.method!=='GET')return;
   const url=new URL(request.url);
   if(url.origin!==self.location.origin)return;
+  if(url.pathname.startsWith('/api/')){
+    event.respondWith(fetch(request));
+    return;
+  }
   if(request.mode==='navigate'){
     event.respondWith(fetch(request).then(response=>{
       const contentType=response.headers.get('content-type')||'';
@@ -56,8 +84,17 @@ self.addEventListener('fetch',event=>{
     }).catch(()=>caches.match('./index.html')));
     return;
   }
-  event.respondWith(caches.match(request,{ignoreSearch:true}).then(async cached=>{
-    if(cached&&request.headers.has('range'))return rangeResponse(request,cached);
+  if(request.headers.has('range')){
+    event.respondWith(caches.match(request,{ignoreSearch:true}).then(cached=>cached?rangeResponse(request,cached):fetch(request)));
+    return;
+  }
+  url.search='';
+  url.hash='';
+  if(APP_SHELL_URLS.has(url.href)){
+    event.respondWith(networkFirst(request));
+    return;
+  }
+  event.respondWith(caches.match(request,{ignoreSearch:true}).then(cached=>{
     if(cached)return cached;
     return fetch(request).then(response=>{
       if(response.ok){const copy=response.clone();caches.open(CACHE).then(cache=>cache.put(request,copy));}

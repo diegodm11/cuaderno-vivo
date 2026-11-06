@@ -8,7 +8,15 @@ backups/
 __pycache__/
 *.pyc
 .pytest_cache/
+data/
+dev-data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Temporary audit artefacts
 *.log
 coverage/
+
+# Local Netlify folder
+.netlify

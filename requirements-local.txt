@@ -1,0 +1,10 @@
+# Dependencias del servidor local funcional (sin servicios externos)
+reportlab==4.5.1
+qrcode==8.2
+Pillow==11.3.0
+opencv-python-headless==5.0.0.93
+numpy==2.0.2
+
+# Verificación de PDF en la suite de pruebas
+pypdf==6.19.0
+pypdfium2>=4.30,<5

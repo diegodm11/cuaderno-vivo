@@ -23,9 +23,16 @@ jobs:
       - name: Validate JavaScript syntax
         run: |
           node --check app.js
+          node --check accessibility-demo.js
+          node --check class-review.js
+          node --check classroom.js
+          node --check curriculum-engine.js
+          node --check learning-capsules.js
+          node --check learning-history.js
           node --check reinforcement.js
           node --check profile-i18n.js
           node --check product-core.js
+          node --check real-workflow.js
           node --check pwa.js
           node --check service-worker.js
       - name: Build production package
@@ -34,7 +41,7 @@ jobs:
         run: python -m unittest tests/test_service_worker_contract.py -v
       - name: Start local server
         run: |
-          python -m http.server 4180 > /tmp/cuaderno-vivo-http.log 2>&1 &
+          python -m http.server 4180 --directory dist > /tmp/cuaderno-vivo-http.log 2>&1 &
           for attempt in $(seq 1 20); do
             curl -fsS http://127.0.0.1:4180/ >/dev/null && exit 0
             sleep 0.5

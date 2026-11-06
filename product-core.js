@@ -7,17 +7,32 @@
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const clone = value => JSON.parse(JSON.stringify(value));
 
+  function normalizeDomain(value) {
+    const next = value && typeof value === 'object' ? value : {};
+    next.version = 1;
+    next.activities = next.activities || {};
+    next.scan = next.scan || null;
+    next.diagnoses = Array.isArray(next.diagnoses) ? next.diagnoses : [];
+    next.reinforcement = next.reinforcement || {};
+    next.exitEvidence = next.exitEvidence || null;
+    next.evidence = Array.isArray(next.evidence) ? next.evidence : [];
+    next.comments = next.comments || {};
+    next.externalCases = Array.isArray(next.externalCases) ? next.externalCases : [];
+    return next;
+  }
+
   function readDomain() {
     try {
       const parsed = JSON.parse(localStorage.getItem(DOMAIN_KEY));
-      if (parsed && parsed.version === 1) return parsed;
+      if (parsed && parsed.version === 1) return normalizeDomain(parsed);
     } catch {}
-    return { version: 1, activities: {}, scan: null, diagnoses: [], reinforcement: {}, exitEvidence: null };
+    return normalizeDomain({ version: 1, activities: {}, scan: null, diagnoses: [], reinforcement: {}, exitEvidence: null });
   }
 
   let domain = readDomain();
   let scanCanvas = null;
   let scanObjectUrl = null;
+  let externalObjectUrl = null;
   const originalSave = window.save || save;
 
   if (sessionStorage.getItem(DELETE_MARKER)) {
@@ -25,11 +40,14 @@
   }
 
   function persist() {
+    if (sessionStorage.getItem(DELETE_MARKER)) return;
     localStorage.setItem(DOMAIN_KEY, JSON.stringify(domain));
+    window.CVLearningStore?.writeDomain(domain).catch(error => console.warn('No se pudo guardar en IndexedDB', error));
   }
 
   function activityKey() {
-    return activityMeta().code;
+    const meta = activityMeta();
+    return `${meta.code}::${meta.topic}`;
   }
 
   function activityRecord(create = true) {
@@ -72,11 +90,15 @@
     const row = control.closest('.q-row');
     const index = rows.indexOf(row);
     if (index < 0 || !questions[index]) return;
-    if (control.matches('input')) questions[index].text = control.value.trim();
-    if (control.matches('select')) {
-      const selects = $$('select', row);
-      if (control === selects[0]) questions[index].skill = control.value;
-      if (control === selects[1]) questions[index].key = control.value;
+    const option = control.dataset.option;
+    const field = control.dataset.field;
+    if (option) {
+      const optionIndex = ['A', 'B', 'C', 'D'].indexOf(option);
+      if (optionIndex >= 0) questions[index].options[optionIndex] = control.value.trim();
+    } else if (field && ['text', 'skill', 'key', 'difficulty', 'explanation'].includes(field)) {
+      questions[index][field] = control.value.trim();
+    } else {
+      return;
     }
     renderPaperAnswers();
     storeQuestions();
@@ -134,13 +156,13 @@
     return total ? dark / total : 0;
   }
 
-  function cornerRatio(data, width, height, left, top) {
+  function cornerRatio(data, width, height, left, top, xSpan = 0.10, ySpan = 0.05) {
     let dark = 0;
     let total = 0;
-    const x0 = left ? 0 : Math.floor(width * 0.90);
-    const x1 = left ? Math.ceil(width * 0.10) : width;
-    const y0 = top ? 0 : Math.floor(height * 0.95);
-    const y1 = top ? Math.ceil(height * 0.05) : height;
+    const x0 = left ? 0 : Math.floor(width * (1 - xSpan));
+    const x1 = left ? Math.ceil(width * xSpan) : width;
+    const y0 = top ? 0 : Math.floor(height * (1 - ySpan));
+    const y1 = top ? Math.ceil(height * ySpan) : height;
     for (let y = y0; y < y1; y++) {
       for (let x = x0; x < x1; x++) {
         const offset = (y * width + x) * 4;
@@ -152,30 +174,67 @@
     return total ? dark / total : 0;
   }
 
-  function analyzeCanvas(canvas) {
+  function cropToOmrInk(canvas) {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const { width, height } = canvas;
-    if (width < 200 || height < 400) throw new Error('La imagen es demasiado pequeña. Usa al menos 200 × 400 píxeles.');
     const image = ctx.getImageData(0, 0, width, height);
+    const step = Math.max(1, Math.floor(Math.max(width, height) / 1600));
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = 0; y < height; y += step) {
+      for (let x = 0; x < width; x += step) {
+        const offset = (y * width + x) * 4;
+        const luminance = 0.2126 * image.data[offset] + 0.7152 * image.data[offset + 1] + 0.0722 * image.data[offset + 2];
+        if (luminance >= 80 || image.data[offset + 3] <= 100) continue;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    }
+    if (maxX < minX || maxY < minY) return canvas;
+    const cropWidth = Math.min(width - minX, maxX - minX + step);
+    const cropHeight = Math.min(height - minY, maxY - minY + step);
+    if (cropWidth < width * 0.35 || cropHeight < height * 0.20) return canvas;
+    if (minX <= step && minY <= step && maxX >= width - step * 2 && maxY >= height - step * 2) return canvas;
+    const cropped = document.createElement('canvas');
+    cropped.width = cropWidth;
+    cropped.height = cropHeight;
+    cropped.getContext('2d').drawImage(canvas, minX, minY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+    return cropped;
+  }
+
+  function analyzeCanvas(sourceCanvas) {
+    const canvas = cropToOmrInk(sourceCanvas);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const { width, height } = canvas;
+    if (width < 200 || height < 150) throw new Error('La imagen es demasiado pequeña. Usa al menos 200 × 150 píxeles.');
+    const image = ctx.getImageData(0, 0, width, height);
+    const landscape = width / height > 1.45;
+    const cornerX = landscape ? 0.05 : 0.10;
+    const cornerY = landscape ? 0.12 : 0.05;
     const corners = [
-      cornerRatio(image.data, width, height, true, true),
-      cornerRatio(image.data, width, height, false, true),
-      cornerRatio(image.data, width, height, true, false),
-      cornerRatio(image.data, width, height, false, false),
+      cornerRatio(image.data, width, height, true, true, cornerX, cornerY),
+      cornerRatio(image.data, width, height, false, true, cornerX, cornerY),
+      cornerRatio(image.data, width, height, true, false, cornerX, cornerY),
+      cornerRatio(image.data, width, height, false, false, cornerX, cornerY),
     ];
-    if (corners.some(value => value < 0.45)) throw new Error('No se reconocen las cuatro referencias negras. Fotografía el recuadro completo.');
+    const cornerThreshold = landscape ? 0.12 : 0.45;
+    if (corners.some(value => value < cornerThreshold)) throw new Error('No se reconocen las cuatro referencias negras. Fotografía el recuadro completo.');
 
     const letters = ['A', 'B', 'C', 'D'];
     const answers = [];
     for (let row = 0; row < 8; row++) {
-      const y = height * ((100 + row * 85) / 800);
+      const y = landscape ? height * (0.218 + row * 0.0937) : height * ((100 + row * 85) / 800);
       const ratios = [0, 1, 2, 3].map(column => darkRatio(
         image.data,
         width,
         height,
-        width * ((80 + column * 80) / 400),
+        landscape ? width * (0.226 + column * 0.1983) : width * ((80 + column * 80) / 400),
         y,
-        Math.max(6, Math.min(width / 400, height / 800) * 18),
+        landscape ? Math.max(4, Math.min(width * 0.008, height * 0.016)) : Math.max(6, Math.min(width / 400, height / 800) * 18),
       ));
       const ranked = ratios.map((score, index) => ({ score, index })).sort((a, b) => b.score - a.score);
       const best = ranked[0];
@@ -192,7 +251,7 @@
         densities: ratios.map(value => Number(value.toFixed(3))),
       });
     }
-    return { answers, corners: corners.map(value => Number(value.toFixed(3))) };
+    return { answers, corners: corners.map(value => Number(value.toFixed(3))), layout: landscape ? 'printed-strip' : 'canonical' };
   }
 
   function showScanMessage(message, type = 'error') {
@@ -201,6 +260,24 @@
     box.hidden = false;
     box.className = `scan-validation ${type}`;
     box.textContent = message;
+  }
+
+  function selectedScanStudent(fileName = '') {
+    const picker = $('#scanStudentCode');
+    const fromName = String(fileName).toUpperCase().match(/(?:^|[^A-Z0-9])(A(?:0[1-9]|1\d|2[0-4]))(?:[^A-Z0-9]|$)/)?.[1];
+    if (fromName && picker) picker.value = fromName;
+    return picker?.value || fromName || 'A01';
+  }
+
+  function syncScanStudentUi(student) {
+    const code = student || selectedScanStudent();
+    if ($('#scanStudentCode')) $('#scanStudentCode').value = code;
+    if ($('#externalStudent')) $('#externalStudent').value = code;
+    if ($('#scanPaperTitle')) $('#scanPaperTitle').textContent = `${activityMeta().topic} · ${code}`.toUpperCase();
+    const queueCode = $('.queue-item.active > span');
+    if (queueCode) queueCode.textContent = code;
+    const reviewStudent = $('.evidence-top > div:first-child strong');
+    if (reviewStudent) reviewStudent.textContent = code;
   }
 
   async function loadScanFile(file) {
@@ -224,8 +301,10 @@
     bitmap.close?.();
     try {
       const analysis = analyzeCanvas(canvas);
+      const student = selectedScanStudent(file.name);
+      syncScanStudentUi(student);
       scanCanvas = canvas;
-      domain.scan = { ...analysis, student: 'A07', activity: activityKey(), capturedAt: new Date().toISOString() };
+      domain.scan = { ...analysis, student, activity: activityKey(), capturedAt: new Date().toISOString() };
       persist();
       if (scanObjectUrl) URL.revokeObjectURL(scanObjectUrl);
       scanObjectUrl = URL.createObjectURL(file);
@@ -235,12 +314,56 @@
       showScanMessage('Plantilla reconocida. Las ocho filas se han leído localmente; revisa cualquier marca dudosa.', 'success');
       $('#scannerState span').textContent = 'Imagen validada · lista para procesar';
     } catch (error) {
-      showScanMessage(error.message || 'No se reconoce la plantilla controlada.');
+      syncScanStudentUi(selectedScanStudent(file.name));
+      openExternalTestFile(
+        file,
+        'La foto no corresponde a la plantilla controlada. Se ha abierto automáticamente como test externo: confirma la respuesta observada y la clave para corregirlo sin volver a subirla.',
+      );
     }
+  }
+
+  function renderScanSummary() {
+    const root = $('#scanAnswerSummary');
+    const body = $('#scanAnswerSummary tbody');
+    if (!root || !body || !domain.scan?.answers?.length) return;
+    body.replaceChildren();
+    let correctCount = 0;
+    let incorrectCount = 0;
+    let reviewCount = 0;
+    domain.scan.answers.forEach(item => {
+      const question = questions[item.question - 1] || questions[0];
+      const needsReview = item.uncertain || item.answer === 'blank';
+      const correct = !needsReview && item.answer === question.key;
+      if (needsReview) reviewCount++;
+      else if (correct) correctCount++;
+      else incorrectCount++;
+      const row = document.createElement('tr');
+      const values = [
+        `P${item.question}`,
+        item.answer === 'blank' ? 'En blanco' : item.answer,
+        question.key,
+      ];
+      values.forEach(value => {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        row.appendChild(cell);
+      });
+      const stateCell = document.createElement('td');
+      const state = document.createElement('span');
+      state.className = `scan-summary-state ${needsReview ? 'review' : correct ? 'correct' : 'incorrect'}`;
+      state.textContent = needsReview ? 'Revisar' : correct ? 'Correcta' : 'Incorrecta';
+      stateCell.appendChild(state);
+      row.appendChild(stateCell);
+      body.appendChild(row);
+    });
+    $('#scanSummaryScore').textContent = `${correctCount} correctas · ${incorrectCount} incorrectas · ${reviewCount} revisar`;
+    root.hidden = false;
   }
 
   function updateReviewFromScan(item) {
     if (!item) return;
+    renderScanSummary();
+    syncScanStudentUi(domain.scan?.student);
     const question = questions[item.question - 1] || questions[0];
     $('#reviewPrompt').textContent = question.text;
     $('.evidence-top>div:nth-child(2) strong').textContent = `${item.question} de 8`;
@@ -320,6 +443,15 @@
     }, 700);
   }
 
+  $('#scanStudentCode')?.addEventListener('change', event => {
+    syncScanStudentUi(event.target.value);
+    if (domain.scan?.answers?.length) {
+      domain.scan.student = event.target.value;
+      persist();
+    }
+  });
+  syncScanStudentUi(selectedScanStudent());
+
   $('#photoInput')?.addEventListener('change', event => {
     event.stopImmediatePropagation();
     loadScanFile(event.target.files?.[0]);
@@ -330,6 +462,181 @@
     event.stopImmediatePropagation();
     startScan();
   }, true);
+
+  function writeExternalStatus(element, title, detail, className = '') {
+    if (!element) return;
+    element.hidden = false;
+    element.className = `${element.id === 'externalProgress' ? 'external-progress' : 'external-result'}${className ? ` ${className}` : ''}`;
+    const heading = document.createElement('strong');
+    heading.textContent = title;
+    const copy = document.createElement('span');
+    copy.textContent = detail;
+    element.replaceChildren(heading, copy);
+  }
+
+  function readExternalValue(id) {
+    return String($('#' + id)?.value || '').trim();
+  }
+
+  function openExternalTestFile(file, notice = 'Test externo cargado. Confirma la respuesta observada y la clave para corregirlo y guardar el seguimiento.') {
+    const result = $('#externalResult');
+    if (!file || !/^image\/(png|jpeg|webp)$/.test(file.type) || file.size > 12 * 1024 * 1024) {
+      writeExternalStatus(result, 'No se puede abrir la foto', 'Selecciona una imagen PNG, JPG o WebP de hasta 12 MB.', 'incorrect');
+      return false;
+    }
+    if (externalObjectUrl) URL.revokeObjectURL(externalObjectUrl);
+    externalObjectUrl = URL.createObjectURL(file);
+    $('#externalPhotoPreview').src = externalObjectUrl;
+    $('#externalPhotoName').textContent = file.name;
+    const panel = $('#externalTestPanel');
+    panel.hidden = false;
+    panel.dataset.photoName = file.name;
+    delete panel.dataset.caseId;
+    result.hidden = true;
+    $('#externalFollowupPanel').hidden = true;
+    const flowNotice = $('#externalFlowNotice');
+    flowNotice.textContent = notice;
+    flowNotice.hidden = false;
+    const scanValidation = $('#scanValidation');
+    if (scanValidation) scanValidation.hidden = true;
+    if ($('#scannerState span')) $('#scannerState span').textContent = 'Test externo cargado · completa los datos de corrección';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return true;
+  }
+
+  $('#externalTestPhoto')?.addEventListener('change', event => {
+    openExternalTestFile(event.target.files?.[0]);
+    event.target.value = '';
+  });
+
+  $('#gradeExternalTest')?.addEventListener('click', () => {
+    const panel = $('#externalTestPanel');
+    const result = $('#externalResult');
+    const student = readExternalValue('externalStudent').toUpperCase();
+    const prompt = readExternalValue('externalQuestion');
+    const skill = readExternalValue('externalSkill');
+    const observed = readExternalValue('externalObserved');
+    const expected = readExternalValue('externalExpected');
+    if (!panel?.dataset.photoName || !student || !prompt || !skill || !observed || !expected) {
+      writeExternalStatus(result, 'Faltan datos por confirmar', 'Carga la foto y completa alumno, pregunta, habilidad, respuesta observada y respuesta correcta.', 'incorrect');
+      return;
+    }
+    const correct = observed === expected;
+    const capturedAt = new Date().toISOString();
+    const caseId = panel.dataset.caseId || `external-${Date.now()}`;
+    panel.dataset.caseId = caseId;
+    const record = {
+      id: caseId,
+      student,
+      prompt,
+      skill,
+      observed,
+      expected,
+      correct,
+      photoName: panel.dataset.photoName,
+      capturedAt,
+      followup: null,
+    };
+    domain.externalCases = domain.externalCases.filter(item => item.id !== caseId).concat(record);
+    const evidence = {
+      id: `${caseId}:initial`,
+      activity: caseId,
+      student,
+      phase: 'initial',
+      question: 'EXT-1',
+      prompt,
+      skill,
+      observed,
+      expected,
+      correct,
+      errorCode: correct ? '' : 'Respuesta incorrecta en un test externo; interpretación conceptual pendiente del profesor',
+      confidence: null,
+      reviewed: true,
+      source: 'external-photo',
+      capturedAt,
+    };
+    domain.evidence = domain.evidence.filter(item => item.id !== evidence.id).concat(evidence);
+    domain.diagnoses = domain.diagnoses.filter(item => !(item.student === student && item.source === 'external-photo'));
+    domain.diagnoses.push({
+      student,
+      question: 'EXT-1',
+      skill,
+      observed,
+      expected,
+      status: correct ? 'confirmed-correct' : 'needs-support',
+      error: correct ? 'Respuesta inicial correcta; comprobar transferencia con una pregunta distinta.' : `Respondió ${observed === 'blank' ? 'en blanco' : observed}; la respuesta correcta confirmada es ${expected}.`,
+      source: 'external-photo',
+      reviewedAt: capturedAt,
+    });
+    writeExternalStatus(
+      result,
+      correct ? 'Correcta · evidencia inicial guardada' : 'Incorrecta · evidencia inicial guardada',
+      `Respuesta observada: ${observed === 'blank' ? 'en blanco' : observed}. Respuesta correcta confirmada: ${expected}. La interpretación pedagógica sigue siendo decisión del profesor.`,
+      correct ? '' : 'incorrect',
+    );
+    $('#externalFollowupPanel').hidden = false;
+    $('#externalProgress').hidden = true;
+    if ($('#reinforceGroupStudents')) $('#reinforceGroupStudents').textContent = student;
+    if ($('#reinforceSkill')) $('#reinforceSkill').textContent = skill;
+    if ($('#reinforceNeed')) $('#reinforceNeed').textContent = correct
+      ? 'Comprobar transferencia con una pregunta distinta.'
+      : `Revisar por qué eligió ${observed === 'blank' ? 'en blanco' : observed} cuando la clave confirmada es ${expected}.`;
+    if ($('#reinforceTitle')) $('#reinforceTitle').textContent = `Refuerzo de ${skill}`;
+    persist();
+    window.CVLearningDashboard?.render();
+  });
+
+  $('#saveExternalFollowup')?.addEventListener('click', () => {
+    const panel = $('#externalTestPanel');
+    const progress = $('#externalProgress');
+    const caseId = panel?.dataset.caseId;
+    const record = domain.externalCases.find(item => item.id === caseId);
+    const prompt = readExternalValue('externalFollowupQuestion');
+    const observed = readExternalValue('externalFollowupObserved');
+    const expected = readExternalValue('externalFollowupExpected');
+    if (!record || !prompt || !observed || !expected) {
+      writeExternalStatus(progress, 'Faltan datos de seguimiento', 'Escribe una pregunta distinta y confirma la respuesta del alumno y su clave.', 'incorrect');
+      return;
+    }
+    const correct = observed === expected;
+    const capturedAt = new Date().toISOString();
+    record.followup = { prompt, observed, expected, correct, capturedAt };
+    const evidence = {
+      id: `${caseId}:exit`,
+      activity: caseId,
+      student: record.student,
+      phase: 'exit',
+      question: 'EXT-R1',
+      prompt,
+      skill: record.skill,
+      observed,
+      expected,
+      correct,
+      errorCode: correct ? '' : 'La habilidad todavía no se demuestra en una pregunta diferente',
+      confidence: null,
+      reviewed: true,
+      source: 'external-photo',
+      capturedAt,
+    };
+    domain.evidence = domain.evidence.filter(item => item.id !== evidence.id).concat(evidence);
+    const before = record.correct ? 100 : 0;
+    const after = correct ? 100 : 0;
+    const change = after - before;
+    const direction = change > 0 ? `+${change} puntos porcentuales` : change < 0 ? `${change} puntos porcentuales` : 'sin cambio';
+    writeExternalStatus(
+      progress,
+      `${before} % → ${after} % · ${direction}`,
+      correct
+        ? 'La respuesta posterior es correcta en una pregunta distinta. Es mejora inmediata, todavía provisional hasta una comprobación demorada.'
+        : 'La respuesta posterior sigue siendo incorrecta. Cambia el apoyo y registra otra evidencia distinta; no marques dominio.',
+    );
+    persist();
+    window.CVLearningDashboard?.render();
+  });
+
+  window.addEventListener('beforeunload', () => {
+    if (externalObjectUrl) URL.revokeObjectURL(externalObjectUrl);
+  });
 
   function diagnosisFromReview(answer) {
     const scanItem = domain.scan?.answers?.find(item => item.uncertain || item.answer === 'blank') || domain.scan?.answers?.[5];
@@ -347,11 +654,43 @@
     };
   }
 
+  function recordInitialEvidence(reviewedAnswer) {
+    if (!domain.scan?.answers?.length) return;
+    const reviewedItem = domain.scan.answers.find(item => item.uncertain || item.answer === 'blank') || domain.scan.answers[5];
+    const student = domain.scan.student || 'A07';
+    const activity = domain.scan.activity || activityKey();
+    const capturedAt = new Date().toISOString();
+    const additions = domain.scan.answers.map(item => {
+      const question = questions[item.question - 1] || questions[0];
+      const reviewed = item.question === reviewedItem?.question;
+      const observed = reviewed ? reviewedAnswer : item.answer;
+      const correct = observed === question.key;
+      return {
+        id: `${activity}:${student}:initial:${item.question}`,
+        activity,
+        student,
+        phase: 'initial',
+        question: item.question,
+        skill: question.skill,
+        observed,
+        expected: question.key,
+        correct,
+        errorCode: correct ? '' : question.error,
+        confidence: item.confidence,
+        reviewed,
+        capturedAt,
+      };
+    });
+    const ids = new Set(additions.map(item => item.id));
+    domain.evidence = domain.evidence.filter(item => !ids.has(item.id)).concat(additions);
+  }
+
   $('#confirmAnswer')?.addEventListener('click', () => {
     setTimeout(() => {
       const diagnosis = diagnosisFromReview(state.reviewAnswer);
       domain.diagnoses = domain.diagnoses.filter(item => item.student !== diagnosis.student);
       domain.diagnoses.push(diagnosis);
+      recordInitialEvidence(state.reviewAnswer);
       persist();
       const students = domain.diagnoses.filter(item => item.status === 'needs-support').map(item => item.student);
       if ($('#reinforceGroupStudents')) $('#reinforceGroupStudents').textContent = students.join(' · ') || 'Sin alumnos pendientes';
@@ -359,9 +698,15 @@
       if (count) count.textContent = String(students.length);
       if ($('#reinforceNeed')) $('#reinforceNeed').textContent = diagnosis.error;
       if ($('#reinforceSkill')) $('#reinforceSkill').textContent = diagnosis.skill;
+      const pattern = window.CVLearningEngine?.summarize(domain.evidence, diagnosis.student).patterns[0];
+      if (pattern) {
+        if ($('#reinforceTitle')) $('#reinforceTitle').textContent = `Trabajar patrón: ${pattern.label}`;
+        if ($('#reinforceNeed')) $('#reinforceNeed').textContent = pattern.explanation;
+      }
       if (scanObjectUrl) { URL.revokeObjectURL(scanObjectUrl); scanObjectUrl = null; }
       $('.camera-stage')?.style.removeProperty('background-image');
       scanCanvas = null;
+      window.CVLearningDashboard?.render();
     }, 0);
   });
 
@@ -404,13 +749,14 @@
   $('#previewMaterial')?.addEventListener('click', () => {
     const target = $('#previewSheetTasks');
     if (target) {
-      target.innerHTML = '';
+      const lines = $$('.preview-step', target);
       taskTexts().slice(0, 5).forEach((text, index) => {
-        const line = document.createElement('p');
+        const line = lines[index];
+        if (!line) return;
+        line.innerHTML = '';
         const number = document.createElement('b');
         number.textContent = `${index + 1}. `;
         line.append(number, document.createTextNode(text));
-        target.appendChild(line);
       });
     }
   });
@@ -428,31 +774,76 @@
 
   function paintExitEvidence(result) {
     const score = `${result.score}/2`;
+    const percent = Math.round((result.score / 2) * 100);
     $('.comparison-pro .green').textContent = score;
     if ($('#tableExitScore')) $('#tableExitScore').textContent = score;
+
+    const afterRing = $('#resultAfterRing');
+    const afterCard = $('#resultAfterCard');
+    const changeCard = $('#resultChangeCard');
+    const guidance = $('#resultGuidance');
+    if (afterRing) {
+      afterRing.style.setProperty('--score', String(percent));
+      afterRing.classList.remove('pending');
+    }
+    if ($('#resultAfterPercent')) $('#resultAfterPercent').textContent = `${percent} %`;
+    if ($('#resultAfterFraction')) $('#resultAfterFraction').textContent = `${result.score} de 2 correctas`;
+    if ($('#resultDelta')) $('#resultDelta').textContent = `+${percent}`;
+    if (afterCard) afterCard.dataset.score = String(percent);
+    if (changeCard) changeCard.dataset.score = String(percent);
+
     const stateElement = $('#progressState');
     const tableState = $('#tableExitState');
     if (result.score === 2) {
       stateElement.textContent = 'Mejora inmediata observada';
       stateElement.className = 'tag success';
       if (tableState) { tableState.textContent = 'Provisional'; tableState.className = 'tag success'; }
+      if ($('#resultAfterExplanation')) $('#resultAfterExplanation').textContent = 'Ha resuelto correctamente las 2 preguntas nuevas: 100 % de aciertos.';
+      if ($('#resultChangeTitle')) $('#resultChangeTitle').textContent = 'Mejora completa en esta comprobación';
+      if ($('#resultChangeExplanation')) $('#resultChangeExplanation').textContent = 'Pasa del 0 % al 100 %: mejora de 100 puntos porcentuales.';
+      if (guidance) guidance.className = 'result-guidance success';
+      if ($('.result-guidance-icon')) $('.result-guidance-icon').textContent = '✓';
+      if ($('#resultGuidanceTitle')) $('#resultGuidanceTitle').textContent = 'Siguiente paso recomendado';
+      if ($('#resultGuidanceText')) $('#resultGuidanceText').textContent = 'La mejora inmediata está observada, pero todavía es provisional. Programa una pregunta diferente para mañana y otra dentro de 7 días. Si mantiene al menos un 80 %, marca dominio estable.';
     } else if (result.score === 1) {
       stateElement.textContent = 'Progreso parcial';
       stateElement.className = 'tag warning';
       if (tableState) { tableState.textContent = 'Observar'; tableState.className = 'tag warning'; }
+      if ($('#resultAfterExplanation')) $('#resultAfterExplanation').textContent = 'Ha resuelto 1 de 2 preguntas nuevas: 50 % de aciertos.';
+      if ($('#resultChangeTitle')) $('#resultChangeTitle').textContent = 'Mejora parcial';
+      if ($('#resultChangeExplanation')) $('#resultChangeExplanation').textContent = 'Pasa del 0 % al 50 %: mejora de 50 puntos porcentuales.';
+      if (guidance) guidance.className = 'result-guidance warning';
+      if ($('.result-guidance-icon')) $('.result-guidance-icon').textContent = '!';
+      if ($('#resultGuidanceTitle')) $('#resultGuidanceTitle').textContent = 'Revisar antes de avanzar';
+      if ($('#resultGuidanceText')) $('#resultGuidanceText').textContent = 'Revisa cuál de las dos preguntas falló, pide que explique por qué conserva el denominador y ofrece una práctica guiada. Después registra dos preguntas nuevas; no marques todavía el dominio.';
     } else {
       stateElement.textContent = 'Necesita otro apoyo';
       stateElement.className = 'tag danger';
       if (tableState) { tableState.textContent = 'Reforzar'; tableState.className = 'tag danger'; }
+      if ($('#resultAfterExplanation')) $('#resultAfterExplanation').textContent = 'No ha resuelto correctamente ninguna de las 2 preguntas nuevas: 0 %.';
+      if ($('#resultChangeTitle')) $('#resultChangeTitle').textContent = 'Sin cambio observado';
+      if ($('#resultChangeExplanation')) $('#resultChangeExplanation').textContent = 'Permanece en el 0 %: el refuerzo aún no se transfiere a preguntas nuevas.';
+      if (guidance) guidance.className = 'result-guidance danger';
+      if ($('.result-guidance-icon')) $('.result-guidance-icon').textContent = '↻';
+      if ($('#resultGuidanceTitle')) $('#resultGuidanceTitle').textContent = 'Cambiar la forma de apoyo';
+      if ($('#resultGuidanceText')) $('#resultGuidanceText').textContent = 'No repitas la misma ficha. Vuelve al modelo visual de quintos, resuelve un ejemplo en voz alta y guía otro paso a paso. Comprueba de nuevo con dos preguntas diferentes antes de avanzar.';
+    }
+    if ($('#resultStartAction')) {
+      $('#resultStartAction').textContent = 'Registrar otra comprobación →';
+      $('#resultStartAction').hidden = false;
     }
   }
 
-  $('#simulateExit')?.addEventListener('click', event => {
-    event.preventDefault();
-    event.stopImmediatePropagation();
+  function openExitEvidence(event) {
+    event?.preventDefault();
+    event?.stopImmediatePropagation();
     $('#exitEvidenceForm').hidden = false;
-    $('#exitEvidenceForm select').first?.focus();
-  }, true);
+    $('#exitEvidenceForm select')?.focus();
+    $('#exitEvidenceForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  $('#simulateExit')?.addEventListener('click', openExitEvidence, true);
+  $('#resultStartAction')?.addEventListener('click', openExitEvidence);
 
   $('#exitEvidenceForm')?.addEventListener('submit', event => {
     event.preventDefault();
@@ -461,10 +852,30 @@
     const keys = ['C', 'B'];
     const score = responses.reduce((total, answer, index) => total + Number(answer === keys[index]), 0);
     domain.exitEvidence = { student: 'A07', responses, keys, score, capturedAt: new Date().toISOString() };
+    const diagnosis = domain.diagnoses.find(item => item.student === 'A07');
+    const skill = diagnosis?.skill || 'Operar';
+    const activity = activityKey();
+    const exitRecords = responses.map((answer, index) => ({
+      id: `${activity}:A07:exit:R${index + 1}`,
+      activity,
+      student: 'A07',
+      phase: 'exit',
+      question: `R${index + 1}`,
+      skill,
+      observed: answer,
+      expected: keys[index],
+      correct: answer === keys[index],
+      errorCode: answer === keys[index] ? '' : 'La estrategia todavía no se transfiere a una pregunta nueva',
+      reviewed: true,
+      capturedAt: domain.exitEvidence.capturedAt,
+    }));
+    const exitIds = new Set(exitRecords.map(item => item.id));
+    domain.evidence = domain.evidence.filter(item => !exitIds.has(item.id)).concat(exitRecords);
     persist();
     paintExitEvidence(domain.exitEvidence);
     event.currentTarget.hidden = true;
     toast(`Exit ticket registrado: ${score}/2. La decisión final sigue siendo docente.`);
+    window.CVLearningDashboard?.render();
   });
 
   $('#deleteDemo')?.addEventListener('click', async event => {
@@ -472,6 +883,7 @@
     event.stopImmediatePropagation();
     sessionStorage.setItem(DELETE_MARKER, '1');
     Object.keys(localStorage).filter(key => key.startsWith('cv-')).forEach(key => localStorage.removeItem(key));
+    await window.CVLearningStore?.clear();
     if ('caches' in window) {
       const names = await caches.keys();
       await Promise.all(names.filter(name => name.startsWith('cuaderno-vivo')).map(name => caches.delete(name)));
@@ -479,11 +891,12 @@
     location.reload();
   }, true);
 
-  $('#resetDemo')?.addEventListener('click', event => {
+  $('#resetDemo')?.addEventListener('click', async event => {
     event.preventDefault();
     event.stopImmediatePropagation();
     localStorage.removeItem(DOMAIN_KEY);
     localStorage.removeItem('cv-pro-state');
+    await window.CVLearningStore?.clear();
     location.reload();
   }, true);
 
@@ -495,7 +908,7 @@
       try { value = JSON.parse(value); } catch {}
       return [key, value];
     }));
-    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), schema: 1, storage }, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), schema: 2, storage, indexedDB: clone(domain) }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -522,5 +935,20 @@
     getDomain: () => clone(domain),
     loadScanFile,
     startScan,
+    async setTeacherComment(student, comment) {
+      domain.comments[student] = { text: String(comment || '').slice(0, 500), reviewedAt: new Date().toISOString() };
+      persist();
+      return clone(domain.comments[student]);
+    },
   };
+
+  if (!sessionStorage.getItem(DELETE_MARKER)) window.CVLearningStore?.initialize(domain).then(saved => {
+    if (!saved) return;
+    domain = normalizeDomain(saved);
+    localStorage.setItem(DOMAIN_KEY, JSON.stringify(domain));
+    restoreQuestions();
+    restoreReinforcement();
+    if (domain.exitEvidence) paintExitEvidence(domain.exitEvidence);
+    window.CVLearningDashboard?.render();
+  }).catch(error => console.warn('IndexedDB no disponible; se mantiene la copia local compatible.', error));
 })();
